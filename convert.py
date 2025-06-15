@@ -7,6 +7,7 @@ Usage:
     convert.py collection <DB>
     convert.py new <JSON> <DB>
     convert.py fetch-images <DB>
+    convert.py fetch-front-side <JSON> <DB>
     convert.py fetch-sets <JSON> <DB>
 """
 
@@ -147,8 +148,34 @@ elif args["fetch-images"]:
                 sleep(0.01)
             else:
                 print("failed to fetch image")
+elif args["fetch-front-side"]:
+    con = sqlite3.connect(args["<DB>"])
+    cur = con.cursor()
+    with open(args["<JSON>"], "r", encoding="utf-8") as file:
+        parser = ijson.items(file, "item")
+        with tqdm(
+            total=cur.execute("SELECT COUNT(*) FROM cards WHERE layout IN ('transform', 'modal_dfc')").fetchone()[0]
+        ) as pbar:
+            for item in parser:
+                if item["digital"]:
+                    continue
+                if item["layout"] in ["transform", "modal_dfc"]:
+                    uri = item["card_faces"][0]["image_uris"]["small"]
+                    if uri != cur.execute("SELECT uri FROM images WHERE id = ?", (item["id"],)).fetchone()[0]:
+                        res = requests.get(uri)
+                        if res.status_code == 200:
+                            cur.execute(
+                                "UPDATE images SET uri = ?, image = ? WHERE id = ?", (uri, res.content, item["id"])
+                            )
+                            con.commit()
+                            sleep(0.01)
+
+                    pbar.update(1)
+
+
 elif args["collection"]:
-    from tkinter import Tk, ttk, StringVar, Canvas
+    from tkinter import Tk, ttk, StringVar, Canvas, INSERT
+    from ttkwidgets.autocomplete import AutocompleteEntry
     from tkinter.messagebox import Message
     from PIL import ImageTk, Image
     import io
@@ -195,7 +222,20 @@ elif args["collection"]:
 
     uuid = StringVar()
     query = StringVar()
-    ttk.Entry(add_card, textvariable=query, width=120).grid(row=1, column=1, columnspan=3)
+    ent_query = AutocompleteEntry(
+        add_card,
+        textvariable=query,
+        width=120,
+        completevalues=list(map(lambda x: f"{x[0]}[{x[1]}]", cur.execute("SELECT type, reference FROM locations;"))),
+    )
+
+    def delete_last_word(e):
+        idx_end = e.widget.index(INSERT)
+        idx_begin = e.widget.get().rfind(" ", None, idx_end)
+        e.widget.selection_range(idx_begin, idx_end)
+
+    ent_query.bind("<Control-BackSpace>", delete_last_word)
+    ent_query.grid(row=1, column=1, columnspan=3)
 
     FONT_SIZE = 16
     name = StringVar()
@@ -214,6 +254,45 @@ elif args["collection"]:
     rarity.grid(row=7, column=2, sticky="w", padx=20, ipadx=FONT_SIZE * 0.9)
 
     REG_LOCATION = re.compile(r"(?P<location>\w+)\[(?P<nr>\w+)\]")
+    transactions = []
+
+    def undo_last_transaction(a):
+        if tabs.index(tabs.select()) == 0:
+            if len(transactions) > 0 and transactions[-1][0] == "collection":
+                undo_text = "remove from collection:\n\t" + "\n\t".join(
+                    map(
+                        lambda x: " ".join(x),
+                        cur.execute(
+                            "SELECT name, language, set_name, collector_number FROM collection LEFT JOIN cards ON collection.card_id = cards.id WHERE collection.id IN (SELECT value FROM json_each(?))",
+                            (json.dumps(transactions[-1][1]),),
+                        ),
+                    )
+                )
+                if Message(root, title="Undo", message=undo_text, type="yesno").show() == "yes":
+                    cur.execute(
+                        "DELETE FROM collection WHERE collection.id IN (SELECT value FROM json_each(?))",
+                        (json.dumps(transactions[-1][1]),),
+                    )
+                    con.commit()
+                    print(f"removed collection entries {transactions.pop()[1]}")
+            elif len(transactions) > 0 and transactions[-1][0] == "location":
+                assert len(transactions[-1][1]) == 1
+                undo_text = (
+                    "remove collection: "
+                    + next(
+                        map(
+                            lambda x: f"{x[0]}{x[1]}",
+                            cur.execute(
+                                "SELECT type, reference FROM locations WHERE id = ?", (transactions[-1][1][0],)
+                            ),
+                        )
+                    )
+                    + " ?"
+                )
+                if Message(root, title="Undo", message=undo_text, type="yesno").show() == "yes":
+                    cur.execute("DELETE FROM locations WHERE locations.id = ?", (transactions[-1][1][0],))
+                    con.commit()
+                    print(f"removed location {transactions.pop()[1]}")
 
     def add_to_collection(a):
         if tabs.index(tabs.select()) == 0:
@@ -246,9 +325,28 @@ elif args["collection"]:
                     "INSERT INTO locations(type, reference) VALUES (?, ?) RETURNING id", location_tuple
                 ).fetchone()
                 con.commit()
-            cur.execute(
-                "INSERT INTO collection(card_id, language, location) VALUES (?, ?, ?)", (scry_id, lan, location_id)
-            )
+                transactions.append(("location", [location_id]))
+                print(f"add location {location_id}")
+            new_total = n + cur.execute("SELECT COUNT(*) FROM collection WHERE card_id = ?", (scry_id,)).fetchone()[0]
+            if new_total > 4:
+                if (
+                    Message(
+                        root,
+                        title="Overshoot",
+                        message=f"this would add to {new_total} cards, in collection this is more then 4. Do you really want to add thas?",
+                        type="yesno",
+                    ).show()
+                    == "no"
+                ):
+                    return
+                root.focus_force()
+            buffer = []
+            for i in range(n):
+                (new_id,) = cur.execute(
+                    "INSERT INTO collection(card_id, language, location) VALUES (?, ?, ?) RETURNING id",
+                    (scry_id, lan, location_id),
+                ).fetchone()
+                buffer.append(new_id)
             name.set("")
             expansion.set("")
             language.set("")
@@ -257,8 +355,11 @@ elif args["collection"]:
             amount.set("")
             image.configure(image=backface)
             con.commit()
+            print(f"add to collection: {buffer}")
+            transactions.append(("collection", buffer.copy()))
 
     root.bind("<Return>", add_to_collection)
+    root.bind("<Control-z>", undo_last_transaction)
 
     backface = ImageTk.PhotoImage(Image.open("backface.jpg"))
     image = ttk.Label(add_card, image=backface)
@@ -272,11 +373,11 @@ elif args["collection"]:
         card_language = "en"
         card_amount = "1"
         for part in filter(len, map(str.strip, query.get().split(" "))):
-            if part in ["en", "de", "jp"]:
+            if part in ["en", "de", "jp", "sp"]:
                 card_language = part
                 continue
             if (m := REG_LOCATION.match(part)) is not None:
-                card_location = m.group()
+                card_location = (m.group(1), m.group(2))
                 continue
             if card_nr is not None and part.isdigit():
                 card_amount = int(part)
@@ -289,7 +390,16 @@ elif args["collection"]:
         amount.set(str(card_amount))
         expansion.set(card_set)
         language.set(card_language)
-        location.set(card_location)
+        if (
+            location_amount := cur.execute(
+                "SELECT COUNT(*) FROM collection INNER JOIN locations ON collection.location = locations.id WHERE locations.type = ? AND locations.reference = ?",
+                card_location,
+            ).fetchone()[0]
+        ) > 0:
+            location_amount = str(location_amount)
+        else:
+            location_amount = "(new)"
+        location.set(f"{card_location[0]}[{card_location[1]}] {location_amount}")
 
         if card_set is not None and card_nr is not None:
             try:
@@ -298,10 +408,11 @@ elif args["collection"]:
                     scryfall_uuid,
                     full_name,
                     img,
+                    amount_in_collection,
                 ) = next(
                     cur.execute(
                         "SELECT rarity, id, name, (SELECT image FROM images i WHERE i.id = c.id)"
-                        " AS image FROM cards c WHERE set_name = ? AND collector_number = ?",
+                        " AS image, (SELECT COUNT(*) FROM collection WHERE collection.card_id = c.id) AS amount FROM cards c WHERE set_name = ? AND collector_number = ?",
                         (card_set_short, card_nr),
                     )
                 )
@@ -317,7 +428,7 @@ elif args["collection"]:
                     case _:
                         rarity.configure(background="SystemButtonFace")
                 uuid.set(scryfall_uuid)
-                name.set(full_name)
+                name.set(f"{full_name} ({amount_in_collection})")
                 if img is not None:
                     img = ImageTk.PhotoImage(Image.open(io.BytesIO(img)))
                     image.configure(image=img)
@@ -357,7 +468,7 @@ elif args["collection"]:
         text = []
         for type, ref, n in cur.execute(
             "SELECT locations.type, locations.reference, COUNT(*) FROM collection LEFT JOIN locations ON locations.id = collection.location WHERE collection.card_id = ? GROUP BY locations.id",
-            (scry_id,)
+            (scry_id,),
         ):
             text.append(f"{type}[{ref}] x {n}")
         Message(root, title="Card Locations:", message="\n".join(text), type="ok").show()
