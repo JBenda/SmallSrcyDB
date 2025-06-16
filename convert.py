@@ -384,7 +384,7 @@ elif args["collection"]:
         card_language = "en"
         card_amount = "1"
         for part in filter(len, map(str.strip, query.get().split(" "))):
-            if part in ["en", "de", "jp", "sp"]:
+            if part in ["en", "de", "jp", "sp", "fr"]:
                 card_language = part
                 continue
             if (m := REG_LOCATION.match(part)) is not None:
