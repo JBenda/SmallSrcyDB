@@ -67,6 +67,17 @@ CREATE TABLE locations(
 )
 """
 REG_IGNORE = re.compile(r"(\n|^\s*)", re.MULTILINE)
+
+
+def center_window(window):
+    window.update_idletasks()
+    width = window.winfo_width()
+    height = window.winfo_height()
+    x = window.winfo_screenwidth() // 2 - width // 2
+    y = window.winfo_screenheight() // 2 - height // 2
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+
 args = docopt(__doc__, version="convert.py 1.0")
 if args["new"]:
     if path.isfile(args["<DB>"]):
@@ -174,7 +185,7 @@ elif args["fetch-front-side"]:
 
 
 elif args["collection"]:
-    from tkinter import Tk, ttk, StringVar, Canvas, INSERT
+    from tkinter import Tk, ttk, StringVar, Canvas, INSERT, Toplevel
     from ttkwidgets.autocomplete import AutocompleteEntry
     from tkinter.messagebox import Message
     from PIL import ImageTk, Image
@@ -446,6 +457,18 @@ elif args["collection"]:
 
     def key_press(event):
         if event.keysym == "Escape":
+            if (
+                len(transactions)
+                and Message(
+                    root,
+                    title="Close",
+                    message="Closing the application will void all possibility to reverse transactions.\n"
+                    "Close application?",
+                    type="yesno"
+                ).show()
+                == "no"
+            ):
+                return
             root.destroy()
 
     search_query = StringVar()
@@ -465,36 +488,101 @@ elif args["collection"]:
     GRID_WIDTH = 3
 
     def show_locations(scry_id, name, e):
-        text = []
-        for type, ref, n in cur.execute(
-            "SELECT locations.type, locations.reference, COUNT(*) FROM collection LEFT JOIN locations ON locations.id = collection.location WHERE collection.card_id = ? GROUP BY locations.id",
-            (scry_id,),
-        ):
-            text.append(f"{type}[{ref}] x {n}")
-        Message(root, title="Card Locations:", message="\n".join(text), type="ok").show()
-        root.focus_force()
+        print(isinstance(scry_id, str))
+        if isinstance(scry_id, str):
+            scry_id = [scry_id]
+        location_window = Toplevel(root)
+        for i, id in enumerate(scry_id):
+            ttk.Label(
+                location_window,
+                text="\n".join(
+                    map(
+                        lambda x: f"{x[0]}[{x[1]}] x {x[2]}",
+                        cur.execute(
+                            "SELECT locations.type, locations.reference, COUNT(*) "
+                            "FROM collection LEFT JOIN locations ON locations.id = collection.location "
+                            "WHERE collection.card_id = ?",
+                            (id,),
+                        ),
+                    )
+                ),
+            ).grid(row=0, column=i)
+            image = cur.execute("SELECT image FROM images WHERE id = ?", (id,)).fetchone()
+            if image is None or image[0] is None:
+                card_image = backface
+            else:
+                card_image = ImageTk.PhotoImage(Image.open(io.BytesIO(image[0])))
+            image_label = ttk.Label(location_window, text="??", image=card_image)
+            image_label.image = card_image
+            image_label.grid(row=1, column=i)
+        center_window(location_window)
+
+        def destroy_window(parent, window, e):
+            window.destroy()
+            parent.focus_force()
+
+        location_window.bind("<Escape>", partial(destroy_window, root, location_window))
+        location_window.focus_force()
 
     def new_search_query(a, b, c):
         for widget in image_frame.winfo_children():
             widget.destroy()
-        q = search_query.get().strip()
-        for i, (scry_id, name, image, n) in enumerate(
-            cur.execute(
-                "SELECT cards.id, cards.name, image, COUNT(*)"
-                " FROM cards INNER JOIN collection ON cards.id = collection.card_id"
-                " INNER JOIN images ON images.id == cards.id"
-                f" WHERE name LIKE '%{q}%' GROUP BY cards.id"
-            )
-        ):
-            ttk.Label(image_frame, text=f"{name}, {n}").grid(row=(i // GRID_WIDTH) * 2, column=i % GRID_WIDTH)
-            if image is None:
-                card_image = backface
+        search_name = None
+        search_legal = None
+        search_colorid = None
+        for part in filter(len, map(str.strip, search_query.get().split(" "))):
+            if part.startswith("l:"):
+                search_legal = part[2:]
+                if search_legal == "c":
+                    search_legal = "commander"
+            elif part.startswith("id<="):
+                search_colorid = set(part[4:].upper())
             else:
-                card_image = ImageTk.PhotoImage(Image.open(io.BytesIO(image)))
-            image_label = ttk.Label(image_frame, text=f"{name}, {n}", image=card_image)
-            image_label.image = card_image
-            image_label.grid(row=(i // GRID_WIDTH) * 2 + 1, column=i % GRID_WIDTH)
-            image_label.bind("<Button-1>", partial(show_locations, scry_id, name))
+                if search_name is None:
+                    search_name = []
+                search_name.append(part.strip())
+        query = None
+
+        def append_query(txt):
+            nonlocal query
+            if query is None:
+                query = ""
+            else:
+                query += " AND"
+            query += " " + txt
+
+        if search_legal is not None:
+            append_query(f"(SELECT value FROM json_each(legalities) WHERE key = '{search_legal}') = 'legal'")
+        if search_colorid is not None:
+            append_query(
+                f"(SELECT COUNT(value) FROM json_each('{json.dumps(list(search_colorid))}')"
+                " WHERE INSTR(cards.color_identity, value)) = LENGTH(cards.color_identity)"
+            )
+        if search_name is not None:
+            for part in search_name:
+                append_query(f" cards.name LIKE '%{part}%'")
+
+        print(query)
+        if query is not None:
+            for i, (scry_id, name, image, n) in enumerate(
+                cur.execute(
+                    "SELECT json_group_array(DISTINCT(cards.id)), cards.name, image, COUNT(*)"
+                    " FROM cards INNER JOIN collection ON cards.id = collection.card_id"
+                    " INNER JOIN images ON images.id == cards.id"
+                    f" WHERE {query}"
+                    "GROUP BY cards.name"
+                )
+            ):
+                scry_id = json.loads(scry_id)
+                ttk.Label(image_frame, text=f"{name}, {n}").grid(row=(i // GRID_WIDTH) * 2, column=i % GRID_WIDTH)
+                if image is None:
+                    card_image = backface
+                else:
+                    card_image = ImageTk.PhotoImage(Image.open(io.BytesIO(image)))
+                image_label = ttk.Label(image_frame, text=f"{name}, {n}", image=card_image)
+                image_label.image = card_image
+                image_label.grid(row=(i // GRID_WIDTH) * 2 + 1, column=i % GRID_WIDTH)
+                image_label.bind("<Button-1>", partial(show_locations, scry_id, name))
 
     search_query.trace("w", new_search_query)
 
