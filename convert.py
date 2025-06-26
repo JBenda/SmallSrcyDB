@@ -5,6 +5,7 @@ Important: the db should not exists yet!
 
 Usage:
     convert.py collection <DB>
+    convert.py search <DB> <CARDS>...
     convert.py new <JSON> <DB>
     convert.py fetch-images <DB>
     convert.py fetch-front-side <JSON> <DB>
@@ -20,6 +21,8 @@ import re
 import requests
 from tqdm import tqdm
 from time import sleep
+from scipy.optimize import linprog
+from functools import reduce
 
 CARD_TABLE = """
 create table cards(
@@ -589,3 +592,81 @@ elif args["collection"]:
 
     root.bind("<Escape>", key_press)
     root.mainloop()
+elif args["search"]:
+    con = sqlite3.connect(args["<DB>"])
+    cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
+
+    REG_CARD_NAME = re.compile(r"1 (.*)")
+
+    cards = []
+    for card in args["<CARDS>"]:
+        if path.exists(card):
+            with open(card) as file:
+                for line in file:
+                    cards.append(line)
+        else:
+            cards.append(card)
+
+    buffer = []
+    for card in cards:
+        m = REG_CARD_NAME.match(card.strip())
+        if m is None:
+            print(f"unable to parse '{card.strip()}' as card name, expect '1 Card Name'")
+            exit(1)
+        buffer.append(m.group(1))
+    assert len(cards) == len(set(cards))
+    cards = buffer
+    missing_cards = cur.execute(
+        "SELECT json.value from json_each(?) json LEFT JOIN cards ON lower(json.value) = lower(cards.name) "
+        "WHERE cards.id IS NULL",
+        (json.dumps(cards),),
+    ).fetchall()
+    if len(missing_cards):
+        print("The following card names does not exists! please use the english names")
+        for card in missing_cards:
+            print("\t", card[0])
+        exit(1)
+
+    ids = []
+    sets = []
+    for id, m in map(
+        lambda x: (x[0], set(map(lambda y: cards.index(y), json.loads(x[1])))),
+        con.execute(
+            "SELECT coll.location, json_group_array(DISTINCT(card.name)) FROM ("
+            "  SELECT id, name FROM ("
+            "    SELECT cards.id, cards.name FROM json_each(?) json JOIN cards ON json.value = cards.name)) "
+            "card JOIN collection coll on card.id = coll.card_id GROUP BY coll.location",
+            (json.dumps(cards),),
+        ),
+    ):
+        ids.append(id)
+        sets.append(m)
+    universe = reduce(set.union, sets)
+    assert len(universe) == len(cards)
+    c = [1] * len(sets)
+    a_ub = []
+    b_ub = []
+    for e in universe:
+        con = [0] * len(sets)
+        for j, s in enumerate(sets):
+            if e in s:
+                con[j] = -1
+        a_ub.append(con)
+        b_ub.append(-1)
+    res = linprog(c, A_ub=a_ub, b_ub=b_ub)
+
+    cards_collected = set()
+    for s, _ in sorted(enumerate(res.x), key=lambda x: x[1], reverse=True):
+        print(cur.execute("SELECT type, reference FROM locations WHERE id = ?", (ids[s],)).fetchone())
+        for (card,id) in cur.execute(
+            "SELECT DISTINCT(card.name), card.id FROM cards card JOIN collection coll ON card.id = coll.card_id "
+            "WHERE coll.location = ? AND card.name IN (SELECT value FROM json_each(?))",
+            (ids[s], json.dumps(cards)),
+        ):
+            idx = cards.index(card)
+            if idx not in cards_collected:
+                cards_collected.add(cards.index(card))
+                print("\t", card, "\t", id)
+        if len(cards_collected) == len(universe):
+            break
