@@ -464,7 +464,7 @@ elif args["collection"]:
                     title="Close",
                     message="Closing the application will void all possibility to reverse transactions.\n"
                     "Close application?",
-                    type="yesno"
+                    type="yesno",
                 ).show()
                 == "no"
             ):
@@ -501,7 +501,8 @@ elif args["collection"]:
                         cur.execute(
                             "SELECT locations.type, locations.reference, COUNT(*) "
                             "FROM collection LEFT JOIN locations ON locations.id = collection.location "
-                            "WHERE collection.card_id = ?",
+                            "WHERE collection.card_id = ? "
+                            "GROUP BY locations.id ",
                             (id,),
                         ),
                     )
