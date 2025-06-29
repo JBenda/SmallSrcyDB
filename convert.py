@@ -29,6 +29,12 @@ from time import sleep
 from scipy.optimize import linprog
 from functools import reduce
 from tabulate import tabulate
+from tkinter import ttk
+import tkinter as tk
+from tkinter.messagebox import Message
+from PIL import ImageTk, Image
+import io
+from functools import partial, reduce
 
 CARD_TABLE = """
 create table cards(
@@ -77,6 +83,151 @@ CREATE TABLE locations(
 """
 REG_IGNORE = re.compile(r"(\n|^\s*)", re.MULTILINE)
 REG_LOCATION = re.compile(r"(?P<location>\w+)\[(?P<nr>\w+)\]")
+
+
+class AutocompleteEntry(ttk.Entry):
+    """
+    Subclass of :class:`ttk.Entry` that features autocompletion.
+
+    To enable autocompletion use :meth:`set_completion_list` to define
+    a list of possible strings to hit.
+    To cycle through hits use down and up arrow keys.
+    """
+
+    def __init__(self, master=None, completevalues=None, **kwargs):
+        """
+        Create an AutocompleteEntry.
+
+        :param master: master widget
+        :type master: widget
+        :param completevalues: autocompletion values
+        :type completevalues: list
+        :param kwargs: keyword arguments passed to the :class:`ttk.Entry` initializer
+        """
+        ttk.Entry.__init__(self, master, **kwargs)
+        self._completion_list = completevalues
+        self.set_completion_list(completevalues)
+        self._hits = []
+        self._hit_index = 0
+        self.position = 0
+
+    def set_completion_list(self, completion_list):
+        """
+        Set a new auto completion list
+
+        :param completion_list: completion values
+        :type completion_list: list
+        """
+        self._completion_list = sorted(completion_list, key=str.lower)  # Work with a sorted list
+        self._hits = []
+        self._hit_index = 0
+        self.position = 0
+        self.bind("<KeyRelease>", self.handle_keyrelease)
+
+    def autocomplete(self, delta=0):
+        """
+        Autocomplete the Entry.
+
+        :param delta: 0, 1 or -1: how to cycle through possible hits
+        :type delta: int
+        """
+        idx_end = self.index("insert")
+        query = self.get()
+        idx_begin = query.rfind(" ", None, idx_end) + 1
+        # collect hits
+        _hits = []
+        query = query[idx_begin:idx_end]
+        try:
+            selection_begin = self.index("sel.first")
+            if selection_begin >= idx_begin and selection_begin <= idx_end:
+                query = query[: selection_begin - idx_begin]
+        except tk.TclError:
+            pass
+        if delta:  # need to delete selection otherwise we would fix the current position
+            self.delete(idx_begin + self.position, tk.END)
+        else:  # set position to end so selection starts where textentry ended
+            self.position = len(query)
+        if idx_end - idx_begin > 0:
+            for element in self._completion_list:
+                if element.startswith(query):
+                    _hits.append(element)
+        # if we have a new hit list, keep this in mind
+        if _hits != self._hits:
+            self._hit_index = 0
+            self._hits = _hits
+        # only allow cycling if we are in a known hit list
+        if _hits == self._hits and self._hits:
+            self._hit_index = (self._hit_index + delta) % len(self._hits)
+        # now finally perform the auto completion
+        if self._hits:
+            self.delete(idx_begin, tk.END)
+            self.insert(idx_begin, self._hits[self._hit_index])
+            self.select_range(idx_begin + self.position, tk.END)
+
+    def handle_keyrelease(self, event):
+        """
+        Event handler for the keyrelease event on this widget.
+
+        :param event: Tkinter event
+        """
+        if event.keysym == "BackSpace":
+            self.delete(self.index(tk.INSERT), tk.END)
+            self.position = self.index(tk.END)
+        elif event.keysym == "Left":
+            if self.position < self.index(tk.END):  # delete the selection
+                self.delete(self.position, tk.END)
+            else:
+                self.position -= 1  # delete one character
+                self.delete(self.position, tk.END)
+        elif event.keysym == "Right":
+            self.position = self.index(tk.END)  # go to end (no selection)
+        elif event.keysym == "Down":
+            self.autocomplete(1)  # cycle to next hit
+        elif event.keysym == "Up":
+            self.autocomplete(-1)  # cycle to previous hit
+        elif event.keysym == "Return":
+            self.handle_return(None)
+            return
+        # if len(event.keysym) == 1:
+        else:
+            self.autocomplete()
+
+    def handle_return(self, event):
+        """
+        Function to bind to the Enter/Return key so if Enter is pressed the selection is cleared.
+
+        :param event: Tkinter event
+        """
+        self.icursor(tk.END)
+        self.selection_clear()
+
+    def config(self, **kwargs):
+        """Alias for configure"""
+        self.configure(**kwargs)
+
+    def configure(self, **kwargs):
+        """Configure widget specific keyword arguments in addition to :class:`ttk.Entry` keyword arguments."""
+        if "completevalues" in kwargs:
+            self.set_completion_list(kwargs.pop("completevalues"))
+        return ttk.Entry.configure(self, **kwargs)
+
+    def cget(self, key):
+        """Return value for widget specific keyword arguments"""
+        if key == "completevalues":
+            return self._completion_list
+        return ttk.Entry.cget(self, key)
+
+    def keys(self):
+        """Return a list of all resource names of this widget."""
+        keys = ttk.Entry.keys(self)
+        keys.append("completevalues")
+        return keys
+
+    def __setitem__(self, key, value):
+        self.configure(**{key: value})
+
+    def __getitem__(self, item):
+        return self.cget(item)
 
 
 def center_window(window):
@@ -195,20 +346,13 @@ elif args["fetch-front-side"]:
 
 
 elif args["collection"]:
-    from tkinter import Tk, ttk, StringVar, Canvas, INSERT, Toplevel
-    from ttkwidgets.autocomplete import AutocompleteEntry
-    from tkinter.messagebox import Message
-    from PIL import ImageTk, Image
-    import io
-    from functools import partial
-
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
     cur.execute("PRAGMA foreign_keys = ON")
 
     ROOT_WIDTH = 480
     ROOT_HEIGHT = 360
-    root = Tk()
+    root = tk.Tk()
     root.geometry(
         f"{ROOT_WIDTH}x{ROOT_HEIGHT}"
         f"+{(root.winfo_screenwidth() - ROOT_WIDTH) // 2}+{(root.winfo_screenheight() - ROOT_HEIGHT) // 2}"
@@ -241,8 +385,8 @@ elif args["collection"]:
     tabs.add(search_card, text="Search Cards")
     tabs.pack(expand=True, fill="both")
 
-    uuid = StringVar()
-    query = StringVar()
+    uuid = tk.StringVar()
+    query = tk.StringVar()
     ent_query = AutocompleteEntry(
         add_card,
         textvariable=query,
@@ -251,7 +395,7 @@ elif args["collection"]:
     )
 
     def delete_last_word(e):
-        idx_end = e.widget.index(INSERT)
+        idx_end = e.widget.index(tk.INSERT)
         idx_begin = e.widget.get().rfind(" ", None, idx_end)
         e.widget.selection_range(idx_begin, idx_end)
 
@@ -259,17 +403,17 @@ elif args["collection"]:
     ent_query.grid(row=1, column=1, columnspan=3)
 
     FONT_SIZE = 16
-    name = StringVar()
+    name = tk.StringVar()
     ttk.Label(add_card, textvariable=name, font=("Fira Code", FONT_SIZE)).grid(row=2, column=2, sticky="w", padx=20)
-    amount = StringVar()
+    amount = tk.StringVar()
     ttk.Label(add_card, textvariable=amount, font=("Fira Code", FONT_SIZE)).grid(row=3, column=2, sticky="w", padx=20)
-    expansion = StringVar()
+    expansion = tk.StringVar()
     ttk.Label(add_card, textvariable=expansion, font=("Fira Code", FONT_SIZE)).grid(
         row=4, column=2, sticky="w", padx=20
     )
-    language = StringVar()
+    language = tk.StringVar()
     ttk.Label(add_card, textvariable=language, font=("Fira Code", FONT_SIZE)).grid(row=5, column=2, sticky="w", padx=20)
-    location = StringVar()
+    location = tk.StringVar()
     ttk.Label(add_card, textvariable=location, font=("Fira Code", FONT_SIZE)).grid(row=6, column=2, sticky="w", padx=20)
     rarity = ttk.Label(add_card, text="", font=("Code Fira", FONT_SIZE))
     rarity.grid(row=7, column=2, sticky="w", padx=20, ipadx=FONT_SIZE * 0.9)
@@ -480,11 +624,11 @@ elif args["collection"]:
                 return
             root.destroy()
 
-    search_query = StringVar()
+    search_query = tk.StringVar()
     search_ui = ttk.Frame(search_card)
     search_ui.pack(side="top", fill="x", expand=True)
     ttk.Entry(search_ui, textvariable=search_query, width=120).grid(row=1, column=1)
-    image_canvas = Canvas(search_card)
+    image_canvas = tk.Canvas(search_card)
     image_scorllbar = ttk.Scrollbar(search_card, orient="vertical", command=image_canvas.yview)
     image_frame = ttk.Frame(image_canvas)
     image_frame.bind("<Configure>", lambda e: image_canvas.configure(scrollregion=image_canvas.bbox("all")))
@@ -500,7 +644,7 @@ elif args["collection"]:
         print(isinstance(scry_id, str))
         if isinstance(scry_id, str):
             scry_id = [scry_id]
-        location_window = Toplevel(root)
+        location_window = tk.Toplevel(root)
         for i, id in enumerate(scry_id):
             ttk.Label(
                 location_window,
@@ -613,7 +757,7 @@ elif args["search"]:
             ).fetchone()
         ) is None:
             # FIXME: use location new
-            print(f"location '{args["--target"]}' does not exists")
+            print(f"location '{args['--target']}' does not exists")
             exit(1)
         target_location = target_location[0]
 
@@ -628,15 +772,25 @@ elif args["search"]:
         else:
             cards.append(card)
 
-    buffer = []
+    buffer = set()
     for card in cards:
         m = REG_CARD_NAME.match(card.strip())
         if m is None:
             print(f"unable to parse '{card.strip()}' as card name, expect '1 Card Name'")
             exit(1)
-        buffer.append(m.group(1))
+        buffer.add(m.group(1))
     assert len(cards) == len(set(cards))
     cards = buffer
+    if location is not None:
+        cards = list(
+            map(
+                lambda x: x[0],
+                cur.execute(
+                    "SELECT value FROM json_each(?) WHERE value NOT IN (SELECT card.name FROM collection coll LEFT JOIN cards card ON coll.card_id = card.id WHERE coll.location = ?)",
+                    (json.dumps(cards), location),
+                ),
+            )
+        )
     missing_cards = cur.execute(
         "SELECT json.value from json_each(?) json LEFT JOIN cards ON lower(json.value) = lower(cards.name) "
         "WHERE cards.id IS NULL",
