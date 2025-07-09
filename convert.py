@@ -346,6 +346,7 @@ elif args["fetch-front-side"]:
 
 
 elif args["collection"]:
+    print(args["<DB>"])
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
     cur.execute("PRAGMA foreign_keys = ON")
@@ -420,6 +421,36 @@ elif args["collection"]:
 
     transactions = []
 
+    def check_target_location(location_str):
+        m = REG_LOCATION.match(location_str)
+        if m is None:
+            print("unable to match location str")
+            return
+        location_tuple = tuple(m.groupdict().values())
+        if (
+            m := cur.execute("SELECT id FROM locations WHERE type = ? AND reference = ?", location_tuple).fetchone()
+        ) is not None:
+            location_id = m[0]
+        else:
+            if (
+                Message(
+                    root,
+                    title="New Location",
+                    message=f"should the location '{location_str}' be created?",
+                    type="yesno",
+                ).show()
+                == "no"
+            ):
+                return
+            root.focus_force()
+            (location_id,) = cur.execute(
+                "INSERT INTO locations(type, reference) VALUES (?, ?) RETURNING id", location_tuple
+            ).fetchone()
+            con.commit()
+            transactions.append(("location", [location_id]))
+            print(f"add location {location_id}")
+        return location_id
+
     def undo_last_transaction(a):
         if tabs.index(tabs.select()) == 0:
             if len(transactions) > 0 and transactions[-1][0] == "collection":
@@ -457,40 +488,41 @@ elif args["collection"]:
                     cur.execute("DELETE FROM locations WHERE locations.id = ?", (transactions[-1][1][0],))
                     con.commit()
                     print(f"removed location {transactions.pop()[1]}")
+        elif tabs.index(tabs.select()) == 1:
+            if len(transactions) > 0 and transactions[-1][0] == "move":
+                cards, old, current = transactions[-1][1:]
+                undo_text = (
+                    "move "
+                    + ", ".join(
+                        map(
+                            lambda x: x[0],
+                            cur.execute(
+                                "SELECT DISTINCT(cards.name) FROM cards JOIN collection ON cards.id = collection.card_id WHERE collection.id IN (SELECT value from json_each(?))",
+                                (json.dumps(cards),),
+                            ).fetchall(),
+                        )
+                    )
+                    + " from "
+                    + "-".join(cur.execute("SELECT type, reference FROM locations WHERE id = ?", (current,)).fetchone())
+                    + " to "
+                    + "-".join(cur.execute("SELECT type, reference FROM locations WHERE id = ?", (old,)).fetchone())
+                )
+                if Message(root, title="Undo", message=undo_text, type="yesno").show() == "yes":
+                    cur.execute(
+                        "UPDATE collection SET location = ? WHERE id IN (SELECT value from json_each(?))",
+                        (old, json.dumps(cards)),
+                    )
+                    con.commit()
+                    print(f"moved cards {transactions.pop()[1:]}")
 
-    def add_to_collection(a):
+    def search_action(a):
         if tabs.index(tabs.select()) == 0:
             scry_id = uuid.get()
             lan = language.get()
             n = int(amount.get())
             if n <= 0:
                 return
-            m = REG_LOCATION.match(location.get())
-            if m is None:
-                return
-            location_tuple = tuple(m.groupdict().values())
-            if (
-                m := cur.execute("SELECT id FROM locations WHERE type = ? AND reference = ?", location_tuple).fetchone()
-            ) is not None:
-                location_id = m[0]
-            else:
-                if (
-                    Message(
-                        root,
-                        title="New Location",
-                        message=f"should the location '{location.get()}' be created?",
-                        type="yesno",
-                    ).show()
-                    == "no"
-                ):
-                    return
-                root.focus_force()
-                (location_id,) = cur.execute(
-                    "INSERT INTO locations(type, reference) VALUES (?, ?) RETURNING id", location_tuple
-                ).fetchone()
-                con.commit()
-                transactions.append(("location", [location_id]))
-                print(f"add location {location_id}")
+            location_id = check_target_location(location.get())
             new_total = n + cur.execute("SELECT COUNT(*) FROM collection WHERE card_id = ?", (scry_id,)).fetchone()[0]
             if new_total > 4:
                 if (
@@ -521,8 +553,10 @@ elif args["collection"]:
             con.commit()
             print(f"add to collection: {buffer}")
             transactions.append(("collection", buffer.copy()))
+        elif tabs.index(tabs.select()) == 1:
+            new_search_query()
 
-    root.bind("<Return>", add_to_collection)
+    root.bind("<Return>", search_action)
     root.bind("<Control-z>", undo_last_transaction)
 
     backface = ImageTk.PhotoImage(Image.open("backface.jpg"))
@@ -640,6 +674,90 @@ elif args["collection"]:
 
     GRID_WIDTH = 3
 
+    def destroy_window(parent, window, e):
+        window.destroy()
+        parent.focus_force()
+
+    def move_card_between_collections(location_window, scry_id, e):
+        migration_window = tk.Toplevel(root)
+        collections_raw = cur.execute(
+            "SELECT locations.id, locations.type, locations.reference, COUNT(*) "
+            "FROM collection LEFT JOIN locations ON locations.id = collection.location "
+            "WHERE collection.card_id = ? "
+            "GROUP BY locations.id ",
+            (scry_id,),
+        ).fetchall()
+
+        collections = list(map(lambda x: f"{x[1]}[{x[2]}] x {x[3]}", collections_raw))
+        collection_from = tk.StringVar(value=collections[0])
+        ttk.OptionMenu(migration_window, collection_from, *collections).grid(row=0, column=1)
+        amount = tk.StringVar(value="1")
+        ttk.Label(migration_window, text="x").grid(row=0, column=2)
+        ttk.Entry(migration_window, textvariable=amount, width=3).grid(row=0, column=3)
+        ttk.Label(migration_window, text="=>").grid(row=0, column=4)
+        collection_to = tk.StringVar()
+        AutocompleteEntry(
+            migration_window,
+            textvariable=collection_to,
+            width=80,
+            completevalues=list(
+                map(lambda x: f"{x[0]}[{x[1]}]", cur.execute("SELECT type, reference FROM locations;"))
+            ),
+        ).grid(row=0, column=5)
+
+        def move_card():
+            try:
+                nr = int(amount.get())
+            except ValueError as err:
+                print(err)
+                return
+            idx = collections.index(collection_from.get())
+            from_id, from_name, from_ref, from_nr = collections_raw[idx]
+            if nr > from_nr:
+                Message(
+                    migration_window,
+                    title="To many elements",
+                    message=f"collection only contains {from_nr} crads, but you want to move {nr}",
+                    type="ok",
+                ).show()
+                return
+            if (location_id := check_target_location(collection_to.get().strip())) is None:
+                return
+            if location_id == from_id:
+                Message(
+                    migration_window,
+                    title="Null Action",
+                    message="You tried to move a card to the same collection!",
+                    type="ok",
+                )
+                return
+            cards_to_move = list(
+                map(
+                    lambda x: x[0],
+                    cur.execute(
+                        "SELECT collection.id FROM collection LEFT JOIN locations ON locations.id = collection.location WHERE locations.id = ? AND collection.card_id = ?",
+                        (from_id, scry_id),
+                    ).fetchmany(nr),
+                )
+            )
+            cur.execute(
+                "UPDATE collection SET location = ? WHERE id IN (SELECT value FROM json_each(?))",
+                (location_id, json.dumps(cards_to_move)),
+            )
+            con.commit()
+            print(
+                cards_to_move,
+                f"{from_name}[{from_ref}] ({from_id}) ={nr}=> {collection_to.get().strip()} ({location_id})",
+            )
+            transactions.append(("move", cards_to_move, from_id, location_id))
+            destroy_window(location_window, migration_window, None)
+            destroy_window(root, migration_window, None)
+
+        ttk.Button(migration_window, text="Move", command=move_card).grid(row=1, column=1, columnspan=4)
+        center_window(migration_window)
+        migration_window.bind("<Escape>", partial(destroy_window, location_window, migration_window))
+        migration_window.focus_force()
+
     def show_locations(scry_id, name, e):
         print(isinstance(scry_id, str))
         if isinstance(scry_id, str):
@@ -669,21 +787,20 @@ elif args["collection"]:
             image_label = ttk.Label(location_window, text="??", image=card_image)
             image_label.image = card_image
             image_label.grid(row=1, column=i)
+            image_label.bind("<Button-1>", partial(move_card_between_collections, location_window, id))
         center_window(location_window)
-
-        def destroy_window(parent, window, e):
-            window.destroy()
-            parent.focus_force()
 
         location_window.bind("<Escape>", partial(destroy_window, root, location_window))
         location_window.focus_force()
 
-    def new_search_query(a, b, c):
+    def new_search_query():
         for widget in image_frame.winfo_children():
             widget.destroy()
         search_name = None
         search_legal = None
         search_colorid = None
+        search_set = None
+        search_id = None
         for part in filter(len, map(str.strip, search_query.get().split(" "))):
             if part.startswith("l:"):
                 search_legal = part[2:]
@@ -691,6 +808,10 @@ elif args["collection"]:
                     search_legal = "commander"
             elif part.startswith("id<="):
                 search_colorid = set(part[4:].upper())
+            elif part.startswith("s:"):
+                search_set = part[2:].lower()
+            elif part.startswith("i:"):
+                search_id = part[2:]
             else:
                 if search_name is None:
                     search_name = []
@@ -715,6 +836,10 @@ elif args["collection"]:
         if search_name is not None:
             for part in search_name:
                 append_query(f" cards.name LIKE '%{part}%'")
+        if search_set is not None:
+            append_query(f" cards.set_name = '{search_set}'")
+        if search_id is not None:
+            append_query(f" cards.collector_number = '{search_id}'")
 
         print(query)
         if query is not None:
@@ -738,7 +863,7 @@ elif args["collection"]:
                 image_label.grid(row=(i // GRID_WIDTH) * 2 + 1, column=i % GRID_WIDTH)
                 image_label.bind("<Button-1>", partial(show_locations, scry_id, name))
 
-    search_query.trace("w", new_search_query)
+    # search_query.trace("w", new_search_query)
 
     root.bind("<Escape>", key_press)
     root.mainloop()
