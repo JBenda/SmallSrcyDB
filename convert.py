@@ -5,11 +5,16 @@ Important: the db should not exists yet!
 
 Usage:
     convert.py collection <DB>
-    convert.py search <DB> <CARDS>...
+    convert.py search [-c] [-t <location>] <DB> <CARDS>...
     convert.py new <JSON> <DB>
+    convert.py update <JSON> <DB>
     convert.py fetch-images <DB>
     convert.py fetch-front-side <JSON> <DB>
     convert.py fetch-sets <JSON> <DB>
+
+Options:
+    -c --console  Disable GUI and only produce console output.
+    -t --target <location>  Location where to move the cards.
 """
 
 from docopt import docopt
@@ -23,6 +28,7 @@ from tqdm import tqdm
 from time import sleep
 from scipy.optimize import linprog
 from functools import reduce
+from tabulate import tabulate
 
 CARD_TABLE = """
 create table cards(
@@ -70,6 +76,7 @@ CREATE TABLE locations(
 )
 """
 REG_IGNORE = re.compile(r"(\n|^\s*)", re.MULTILINE)
+REG_LOCATION = re.compile(r"(?P<location>\w+)\[(?P<nr>\w+)\]")
 
 
 def center_window(window):
@@ -267,7 +274,6 @@ elif args["collection"]:
     rarity = ttk.Label(add_card, text="", font=("Code Fira", FONT_SIZE))
     rarity.grid(row=7, column=2, sticky="w", padx=20, ipadx=FONT_SIZE * 0.9)
 
-    REG_LOCATION = re.compile(r"(?P<location>\w+)\[(?P<nr>\w+)\]")
     transactions = []
 
     def undo_last_transaction(a):
@@ -597,6 +603,20 @@ elif args["search"]:
     cur = con.cursor()
     cur.execute("PRAGMA foreign_keys = ON")
 
+    if (target_location := args["--target"]) is not None:
+        if (target_location := REG_LOCATION.match(target_location)) is None:
+            print(f"unable to parse location '{target_location}'")
+            exit(1)
+        if (
+            target_location := cur.execute(
+                "SELECT id FROM locations WHERE type = ? AND reference = ?", tuple(target_location.groupdict().values())
+            ).fetchone()
+        ) is None:
+            # FIXME: use location new
+            print(f"location '{args["--target"]}' does not exists")
+            exit(1)
+        target_location = target_location[0]
+
     REG_CARD_NAME = re.compile(r"1 (.*)")
 
     cards = []
@@ -630,13 +650,21 @@ elif args["search"]:
 
     ids = []
     sets = []
+    if target_location is not None:
+        # remove cards already in collection
+        for (card_in_collection,) in con.execute(
+            "SELECT value FROM (SELECT value FROM json_each(?)) WHERE value NOT IN (SELECT cards.name FROM collection RIGHT JOIN cards ON collection.card_id = cards.id WHERE collection.location = ?)",
+            (json.dumps(cards), target_location),
+        ):
+            cards.remove(card_in_collection)
     for id, m in map(
         lambda x: (x[0], set(map(lambda y: cards.index(y), json.loads(x[1])))),
         con.execute(
-            "SELECT coll.location, json_group_array(DISTINCT(card.name)) FROM ("
-            "  SELECT id, name FROM ("
+            "SELECT coll.location, json_group_array(DISTINCT(card.name)) FROM ( "
+            "  SELECT id, name FROM ( "
             "    SELECT cards.id, cards.name FROM json_each(?) json JOIN cards ON json.value = cards.name)) "
-            "card JOIN collection coll on card.id = coll.card_id GROUP BY coll.location",
+            "card JOIN collection coll on card.id = coll.card_id "
+            "GROUP BY coll.location",
             (json.dumps(cards),),
         ),
     ):
@@ -657,16 +685,118 @@ elif args["search"]:
     res = linprog(c, A_ub=a_ub, b_ub=b_ub)
 
     cards_collected = set()
+    hits = []
     for s, _ in sorted(enumerate(res.x), key=lambda x: x[1], reverse=True):
-        print(cur.execute("SELECT type, reference FROM locations WHERE id = ?", (ids[s],)).fetchone())
-        for (card,id) in cur.execute(
-            "SELECT DISTINCT(card.name), card.id FROM cards card JOIN collection coll ON card.id = coll.card_id "
+        location, ref = cur.execute("SELECT type, reference FROM locations WHERE id = ?", (ids[s],)).fetchone()
+        hits.append([ids[s], f"{location}[{ref}]"])
+        for card, card_id, item_id in cur.execute(
+            "SELECT DISTINCT(card.name), card.id, coll.id FROM cards card "
+            "JOIN collection coll ON card.id = coll.card_id "
             "WHERE coll.location = ? AND card.name IN (SELECT value FROM json_each(?))",
             (ids[s], json.dumps(cards)),
         ):
             idx = cards.index(card)
             if idx not in cards_collected:
                 cards_collected.add(cards.index(card))
-                print("\t", card, "\t", id)
+                hits.append([None, None, card, item_id, card_id])
         if len(cards_collected) == len(universe):
             break
+    if args["--console"]:
+        print(tabulate(hits, tablefmt="simple"))
+        exit(0)
+
+    from tkinter import Tk, ttk, Canvas, StringVar, IntVar
+    from PIL import ImageTk, Image
+    from functools import partial
+
+    ROOT_WIDTH = 480
+    ROOT_HEIGHT = 360
+    GRID_WIDTH = 3
+    root = Tk()
+    root.geometry(
+        f"{ROOT_WIDTH}x{ROOT_HEIGHT}"
+        f"+{(root.winfo_screenwidth() - ROOT_WIDTH) // 2}+{(root.winfo_screenheight() - ROOT_HEIGHT) // 2}"
+    )
+    root.title("DeckListMTG")
+
+    backface = ImageTk.PhotoImage(Image.open("backface.jpg"))
+    top_bar = ttk.Frame(root)
+    top_bar.pack(side="top", fill="x")
+    image_canvas = Canvas(root)
+    image_scorllbar = ttk.Scrollbar(root, orient="vertical", command=image_canvas.yview)
+    image_frame = ttk.Frame(image_canvas)
+    image_frame.bind("<Configure>", lambda e: image_canvas.configure(scrollregion=image_canvas.bbox("all")))
+    image_canvas.create_window((0, 0), window=image_frame, anchor="nw")
+    image_canvas.configure(yscrollcommand=image_scorllbar.set)
+    image_scorllbar.pack(side="right", fill="y")
+    image_canvas.pack(side="left", fill="both", expand=True)
+
+    locations = list(filter(lambda x: x is not None, map(lambda x: x[1], hits)))
+    current_location = StringVar()
+
+    def update_images(value):
+        global selected
+        location_id, begin, end = offsets[value]
+        for widget in image_frame.winfo_children():
+            widget.destroy()
+        selected = list(map(lambda _: IntVar(), range(begin, len(hits) if end is None else end)))
+        for i, (_, _, name, item_id, card_id) in enumerate(hits[begin:end]):
+            # skip cards no longer in the table
+            if (
+                location_id
+                != cur.execute(
+                    "SELECT locations.id FROM collection JOIN locations "
+                    "ON locations.id = collection.location WHERE collection.id = ?",
+                    (item_id,),
+                ).fetchone()[0]
+            ):
+                continue
+            ttk.Checkbutton(image_frame, text=name, variable=selected[i]).grid(
+                row=(i // GRID_WIDTH) * 2, column=i % GRID_WIDTH
+            )
+            image = None
+            if image is None:
+                card_image = backface
+            else:
+                card_image = ImageTk.PhotoImage(Image.open(io.BytesIO(image)))
+            image_label = ttk.Label(image_frame, text=name, image=card_image)
+            image_label.image = card_image
+            image_label.grid(row=(i // GRID_WIDTH) * 2 + 1, column=i % GRID_WIDTH)
+            # image_label.bind("<Button-1>", partial(show_locations, card_id, name))
+
+    ttk.OptionMenu(top_bar, current_location, locations[0], *locations, command=update_images).pack(side="left")
+    if target_location is not None:
+
+        def move_cards():
+            location_id, begin, end = offsets[current_location.get()]
+            entries = list(map(lambda x: x[0] + begin, filter(lambda x: x[1].get(), enumerate(selected))))
+            print(list(map(lambda x: hits[x][2], entries)), location_id, target_location)
+            # FIXME: actually move the cards
+            update_images(current_location.get())
+
+        ttk.Button(top_bar, text="Move", command=move_cards).pack(side="left")
+    selected = None
+
+    offsets = dict(
+        filter(
+            lambda x: x[0] is not None,
+            map(
+                lambda x: (
+                    x[1][1],
+                    (
+                        x[1][0],
+                        x[0] + 1,
+                        next(
+                            map(lambda x: x[0] + 1, filter(lambda x: x[1][0] is not None, enumerate(hits[x[0] + 1 :]))),
+                            None,
+                        ),
+                    ),
+                ),
+                enumerate(hits),
+            ),
+        )
+    )
+    update_images(locations[0])
+
+    root.bind("<Escape>", lambda e: root.destroy())
+    root.mainloop()
