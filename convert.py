@@ -27,7 +27,6 @@ import requests
 from tqdm import tqdm
 from time import sleep
 from scipy.optimize import linprog
-from functools import reduce
 from tabulate import tabulate
 from tkinter import ttk
 import tkinter as tk
@@ -239,6 +238,19 @@ def center_window(window):
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 
+def check_table(sql, name):
+    table = REG_IGNORE.sub("", sql)
+    try:
+        (is_state,) = next(cur.execute(f"SELECT sql FROM sqlite_master WHERE name = '{name}'"))
+        if is_state != table:
+            print(is_state)
+            print(table)
+            Message(root, title="Table Error", message=f"'{name}' table differs from expected schema", type="ok").show()
+            exit(1)
+    except StopIteration:
+        cur.execute(table)
+
+
 args = docopt(__doc__, version="convert.py 1.0")
 if args["new"]:
     if path.isfile(args["<DB>"]):
@@ -291,18 +303,98 @@ if args["new"]:
                     pbar.update(100)
                     data = []
                     image_data = []
+            if len(data):
+                try:
+                    cur.executemany("INSERT INTO cards VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data)
+                except sqlite3.IntegrityError:
+                    for d in data:
+                        for entry in cur.execute("SELECT * FROM cards WHERE id = ?", (d[0],)):
+                            print(d)
+                            print(entry)
+                            print()
+                    exit(1)
+                cur.executemany("INSERT INTO images VALUES(?, ?, NULL)", image_data)
+                con.commit()
+                pbar.update(100)
+                data = []
+                image_data = []
+
+elif args["update"]:
+    con = sqlite3.connect(args["<DB>"])
+    cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
+    with open(args["<JSON>"], "r", encoding="utf-8") as file:
+        parser = ijson.items(file, "item")
+        data = []
+        image_data = []
+        with tqdm(total=100000) as pbar:
+            for item in parser:
+                if item["digital"]:
+                    continue
+                if cur.execute("SELECT COUNT(*) FROM cards WHERE cards.id = ?", (item["id"],)).fetchone()[0]:
+                    continue
+                data.append(
+                    (
+                        item["id"],
+                        item.get("cardmarket_id"),
+                        item["layout"],
+                        item["scryfall_uri"],
+                        item["uri"],
+                        item["rarity"],
+                        "".join(item.get("color_identity", [])),
+                        item.get("mana_cost"),
+                        item["name"],
+                        item["set"],
+                        item["collector_number"],
+                        json.dumps(dict(filter(lambda x: x[0] == "commander", item["legalities"].items()))),
+                        int(item["digital"]),
+                    )
+                )
+                uri = item.get("image_uris", {}).get("small")
+                image_data.append((item["id"], uri))
+                if len(data) > 100:
+                    try:
+                        cur.executemany("INSERT INTO cards VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data)
+                    except sqlite3.IntegrityError:
+                        for d in data:
+                            for entry in cur.execute("SELECT * FROM cards WHERE id = ?", (d[0],)):
+                                print(d)
+                                print(entry)
+                                print()
+                        exit(1)
+                    cur.executemany("INSERT INTO images VALUES(?, ?, NULL)", image_data)
+                    con.commit()
+                    pbar.update(100)
+                    data = []
+                    image_data = []
+            if len(data):
+                try:
+                    cur.executemany("INSERT INTO cards VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", data)
+                except sqlite3.IntegrityError:
+                    for d in data:
+                        for entry in cur.execute("SELECT * FROM cards WHERE id = ?", (d[0],)):
+                            print(d)
+                            print(entry)
+                            print()
+                    exit(1)
+                cur.executemany("INSERT INTO images VALUES(?, ?, NULL)", image_data)
+                con.commit()
+                pbar.update(100)
+                data = []
+                image_data = []
+
 elif args["fetch-sets"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
     sets = {}
-    cur.execute(REG_IGNORE.sub("", SET_TABLE))
+    check_table(SET_TABLE, "sets")
     with open(args["<JSON>"], "r", encoding="utf-8") as file:
         parser = ijson.items(file, "item")
         for item in parser:
             if item["digital"]:
                 continue
             sets[item["set"]] = item["set_name"]
-    cur.executemany("INSERT INTO sets VALUES(?, ?)", sets.items())
+    cur.executemany("INSERT OR IGNORE INTO sets VALUES(?, ?)", sets.items())
     con.commit()
 
 elif args["fetch-images"]:
@@ -351,28 +443,14 @@ elif args["collection"]:
     cur = con.cursor()
     cur.execute("PRAGMA foreign_keys = ON")
 
-    ROOT_WIDTH = 480
-    ROOT_HEIGHT = 360
+    ROOT_WIDTH = 960
+    ROOT_HEIGHT = 570
     root = tk.Tk()
     root.geometry(
         f"{ROOT_WIDTH}x{ROOT_HEIGHT}"
         f"+{(root.winfo_screenwidth() - ROOT_WIDTH) // 2}+{(root.winfo_screenheight() - ROOT_HEIGHT) // 2}"
     )
     root.title("CollectionMTG")
-
-    def check_table(sql, name):
-        table = REG_IGNORE.sub("", sql)
-        try:
-            (is_state,) = next(cur.execute(f"SELECT sql FROM sqlite_master WHERE name = '{name}'"))
-            if is_state != table:
-                print(is_state)
-                print(table)
-                Message(
-                    root, title="Table Error", message=f"'{name}' table differs from expected schema", type="ok"
-                ).show()
-                exit(1)
-        except StopIteration:
-            cur.execute(table)
 
     check_table(COLLECTION_TABLE, "collection")
     check_table(LOCATION_TABLE, "locations")
@@ -660,19 +738,20 @@ elif args["collection"]:
 
     search_query = tk.StringVar()
     search_ui = ttk.Frame(search_card)
-    search_ui.pack(side="top", fill="x", expand=True)
+    search_ui.pack(side="top", fill="x")
     ttk.Entry(search_ui, textvariable=search_query, width=120).grid(row=1, column=1)
     image_canvas = tk.Canvas(search_card)
     image_scorllbar = ttk.Scrollbar(search_card, orient="vertical", command=image_canvas.yview)
     image_frame = ttk.Frame(image_canvas)
     image_frame.bind("<Configure>", lambda e: image_canvas.configure(scrollregion=image_canvas.bbox("all")))
+    search_card.bind_all("<MouseWheel>", lambda e: image_canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
     image_canvas.create_window((0, 0), window=image_frame, anchor="nw")
     image_canvas.configure(yscrollcommand=image_scorllbar.set)
 
     image_scorllbar.pack(side="right", fill="y")
     image_canvas.pack(side="left", fill="both", expand=True)
 
-    GRID_WIDTH = 3
+    GRID_WIDTH = 5
 
     def destroy_window(parent, window, e):
         window.destroy()
@@ -801,6 +880,7 @@ elif args["collection"]:
         search_colorid = None
         search_set = None
         search_id = None
+        search_collection = None
         for part in filter(len, map(str.strip, search_query.get().split(" "))):
             if part.startswith("l:"):
                 search_legal = part[2:]
@@ -812,6 +892,8 @@ elif args["collection"]:
                 search_set = part[2:].lower()
             elif part.startswith("i:"):
                 search_id = part[2:]
+            elif part.startswith("c:"):
+                search_collection = part[2:]
             else:
                 if search_name is None:
                     search_name = []
@@ -835,11 +917,15 @@ elif args["collection"]:
             )
         if search_name is not None:
             for part in search_name:
-                append_query(f" cards.name LIKE '%{part}%'")
+                append_query(f" cards.name LIKE '%{part}%' ")
         if search_set is not None:
-            append_query(f" cards.set_name = '{search_set}'")
+            append_query(f" cards.set_name = '{search_set}' ")
         if search_id is not None:
-            append_query(f" cards.collector_number = '{search_id}'")
+            append_query(f" cards.collector_number = '{search_id}' ")
+        if search_collection is not None:
+            if (location_id := check_target_location(search_collection)) is None:
+                raise ValueError("unable to parse location for search")
+            append_query(f" collection.location = {location_id} ")
 
         print(query)
         if query is not None:
