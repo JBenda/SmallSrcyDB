@@ -251,6 +251,34 @@ def check_table(sql, name):
         cur.execute(table)
 
 
+def undo_move(windows, transactions, cur, con):
+    if len(transactions) > 0 and transactions[-1][0] == "move":
+        cards, old, current = transactions[-1][1:]
+        undo_text = (
+            "move "
+            + ", ".join(
+                map(
+                    lambda x: x[0],
+                    cur.execute(
+                        "SELECT DISTINCT(cards.name) FROM cards JOIN collection ON cards.id = collection.card_id WHERE collection.id IN (SELECT value from json_each(?))",
+                        (json.dumps(cards),),
+                    ).fetchall(),
+                )
+            )
+            + " from "
+            + "-".join(cur.execute("SELECT type, reference FROM locations WHERE id = ?", (current,)).fetchone())
+            + " to "
+            + "-".join(cur.execute("SELECT type, reference FROM locations WHERE id = ?", (old,)).fetchone())
+        )
+        if Message(root, title="Undo", message=undo_text, type="yesno").show() == "yes":
+            cur.execute(
+                "UPDATE collection SET location = ? WHERE id IN (SELECT value from json_each(?))",
+                (old, json.dumps(cards)),
+            )
+            con.commit()
+            print(f"moved cards {transactions.pop()[1:]}")
+
+
 args = docopt(__doc__, version="convert.py 1.0")
 if args["new"]:
     if path.isfile(args["<DB>"]):
@@ -567,31 +595,7 @@ elif args["collection"]:
                     con.commit()
                     print(f"removed location {transactions.pop()[1]}")
         elif tabs.index(tabs.select()) == 1:
-            if len(transactions) > 0 and transactions[-1][0] == "move":
-                cards, old, current = transactions[-1][1:]
-                undo_text = (
-                    "move "
-                    + ", ".join(
-                        map(
-                            lambda x: x[0],
-                            cur.execute(
-                                "SELECT DISTINCT(cards.name) FROM cards JOIN collection ON cards.id = collection.card_id WHERE collection.id IN (SELECT value from json_each(?))",
-                                (json.dumps(cards),),
-                            ).fetchall(),
-                        )
-                    )
-                    + " from "
-                    + "-".join(cur.execute("SELECT type, reference FROM locations WHERE id = ?", (current,)).fetchone())
-                    + " to "
-                    + "-".join(cur.execute("SELECT type, reference FROM locations WHERE id = ?", (old,)).fetchone())
-                )
-                if Message(root, title="Undo", message=undo_text, type="yesno").show() == "yes":
-                    cur.execute(
-                        "UPDATE collection SET location = ? WHERE id IN (SELECT value from json_each(?))",
-                        (old, json.dumps(cards)),
-                    )
-                    con.commit()
-                    print(f"moved cards {transactions.pop()[1:]}")
+            undo_move(root, transactions, cur, con)
 
     def search_action(a):
         if tabs.index(tabs.select()) == 0:
@@ -744,7 +748,7 @@ elif args["collection"]:
     image_scorllbar = ttk.Scrollbar(search_card, orient="vertical", command=image_canvas.yview)
     image_frame = ttk.Frame(image_canvas)
     image_frame.bind("<Configure>", lambda e: image_canvas.configure(scrollregion=image_canvas.bbox("all")))
-    search_card.bind_all("<MouseWheel>", lambda e: image_canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+    search_card.bind_all("<MouseWheel>", lambda e: image_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
     image_canvas.create_window((0, 0), window=image_frame, anchor="nw")
     image_canvas.configure(yscrollcommand=image_scorllbar.set)
 
@@ -847,9 +851,9 @@ elif args["collection"]:
                 location_window,
                 text="\n".join(
                     map(
-                        lambda x: f"{x[0]}[{x[1]}] x {x[2]}",
+                        lambda x: f"{x[0]}[{x[1]}] x {x[2]} ({x[3]})",
                         cur.execute(
-                            "SELECT locations.type, locations.reference, COUNT(*) "
+                            "SELECT locations.type, locations.reference, COUNT(*), collection.language "
                             "FROM collection LEFT JOIN locations ON locations.id = collection.location "
                             "WHERE collection.card_id = ? "
                             "GROUP BY locations.id ",
@@ -972,12 +976,12 @@ elif args["search"]:
             exit(1)
         target_location = target_location[0]
 
-    REG_CARD_NAME = re.compile(r"1 (.*)")
+    REG_CARD_NAME = re.compile(r"(?P<amount>\d+)x (?P<name>[^(]+)\((?P<set>\S+)\) (?P<id>\d+) \[(?P<group>.+)\]")
 
     cards = []
     for card in args["<CARDS>"]:
         if path.exists(card):
-            with open(card) as file:
+            with open(card, encoding="utf-8", newline="\n") as file:
                 for line in file:
                     cards.append(line)
         else:
@@ -989,16 +993,16 @@ elif args["search"]:
         if m is None:
             print(f"unable to parse '{card.strip()}' as card name, expect '1 Card Name'")
             exit(1)
-        buffer.add(m.group(1))
+        buffer.add(m.group("name").strip())
     assert len(cards) == len(set(cards))
-    cards = buffer
-    if location is not None:
+    cards = list(buffer)
+    if target_location is not None:
         cards = list(
             map(
                 lambda x: x[0],
                 cur.execute(
                     "SELECT value FROM json_each(?) WHERE value NOT IN (SELECT card.name FROM collection coll LEFT JOIN cards card ON coll.card_id = card.id WHERE coll.location = ?)",
-                    (json.dumps(cards), location),
+                    (json.dumps(cards), target_location),
                 ),
             )
         )
@@ -1009,19 +1013,12 @@ elif args["search"]:
     ).fetchall()
     if len(missing_cards):
         print("The following card names does not exists! please use the english names")
-        for card in missing_cards:
-            print("\t", card[0])
+        for card in sorted(map(lambda x: x[0], missing_cards)):
+            print("\t", card)
         exit(1)
 
     ids = []
     sets = []
-    if target_location is not None:
-        # remove cards already in collection
-        for (card_in_collection,) in con.execute(
-            "SELECT value FROM (SELECT value FROM json_each(?)) WHERE value NOT IN (SELECT cards.name FROM collection RIGHT JOIN cards ON collection.card_id = cards.id WHERE collection.location = ?)",
-            (json.dumps(cards), target_location),
-        ):
-            cards.remove(card_in_collection)
     for id, m in map(
         lambda x: (x[0], set(map(lambda y: cards.index(y), json.loads(x[1])))),
         con.execute(
@@ -1029,6 +1026,8 @@ elif args["search"]:
             "  SELECT id, name FROM ( "
             "    SELECT cards.id, cards.name FROM json_each(?) json JOIN cards ON json.value = cards.name)) "
             "card JOIN collection coll on card.id = coll.card_id "
+            "JOIN locations on coll.location = locations.id "
+            "WHERE type != 'commander'"
             "GROUP BY coll.location",
             (json.dumps(cards),),
         ),
@@ -1036,16 +1035,20 @@ elif args["search"]:
         ids.append(id)
         sets.append(m)
     universe = reduce(set.union, sets)
-    assert len(universe) == len(cards)
+    # assert len(universe) == len(cards)
+    not_owned = set(cards) - set(map(cards.__getitem__, universe))
+    print("The following cards are not inside your collection:")
+    for c in sorted(not_owned):
+        print("\t", c)
     c = [1] * len(sets)
     a_ub = []
     b_ub = []
     for e in universe:
-        con = [0] * len(sets)
+        conn = [0] * len(sets)
         for j, s in enumerate(sets):
             if e in s:
-                con[j] = -1
-        a_ub.append(con)
+                conn[j] = -1
+        a_ub.append(conn)
         b_ub.append(-1)
     res = linprog(c, A_ub=a_ub, b_ub=b_ub)
 
@@ -1084,6 +1087,11 @@ elif args["search"]:
     )
     root.title("DeckListMTG")
 
+    transactions = []
+
+    def undo_last_transaction(a):
+        undo_move(root, transactions, cur, con)
+
     backface = ImageTk.PhotoImage(Image.open("backface.jpg"))
     top_bar = ttk.Frame(root)
     top_bar.pack(side="top", fill="x")
@@ -1119,11 +1127,11 @@ elif args["search"]:
             ttk.Checkbutton(image_frame, text=name, variable=selected[i]).grid(
                 row=(i // GRID_WIDTH) * 2, column=i % GRID_WIDTH
             )
-            image = None
+            image = cur.execute("SELECT image FROM images WHERE id = ?", (card_id,)).fetchone()
             if image is None:
                 card_image = backface
             else:
-                card_image = ImageTk.PhotoImage(Image.open(io.BytesIO(image)))
+                card_image = ImageTk.PhotoImage(Image.open(io.BytesIO(image[0])))
             image_label = ttk.Label(image_frame, text=name, image=card_image)
             image_label.image = card_image
             image_label.grid(row=(i // GRID_WIDTH) * 2 + 1, column=i % GRID_WIDTH)
@@ -1135,8 +1143,14 @@ elif args["search"]:
         def move_cards():
             location_id, begin, end = offsets[current_location.get()]
             entries = list(map(lambda x: x[0] + begin, filter(lambda x: x[1].get(), enumerate(selected))))
-            print(list(map(lambda x: hits[x][2], entries)), location_id, target_location)
-            # FIXME: actually move the cards
+            cards_to_move = list(map(lambda x: hits[x][3], entries))
+            cur.execute(
+                "UPDATE collection SET location = ? WHERE id IN (SELECT value FROM json_each(?))",
+                (target_location, json.dumps(cards_to_move)),
+            )
+            con.commit()
+            print(cards_to_move, f"{location_id} => {target_location}")
+            transactions.append(("move", cards_to_move, location_id, target_location))
             update_images(current_location.get())
 
         ttk.Button(top_bar, text="Move", command=move_cards).pack(side="left")
@@ -1152,7 +1166,10 @@ elif args["search"]:
                         x[1][0],
                         x[0] + 1,
                         next(
-                            map(lambda x: x[0] + 1, filter(lambda x: x[1][0] is not None, enumerate(hits[x[0] + 1 :]))),
+                            map(
+                                lambda z: z[0] + 1 + x[0],
+                                filter(lambda y: y[1][0] is not None, enumerate(hits[x[0] + 1 :])),
+                            ),
                             None,
                         ),
                     ),
@@ -1163,5 +1180,21 @@ elif args["search"]:
     )
     update_images(locations[0])
 
-    root.bind("<Escape>", lambda e: root.destroy())
+    def close(e):
+        if (
+            len(transactions)
+            and Message(
+                root,
+                title="Close",
+                message="Closing the application will void all possibility to reverse transactions.\n"
+                "Close application?",
+                type="yesno",
+            ).show()
+            == "no"
+        ):
+            return
+        root.destroy()
+
+    root.bind("<Escape>", close)
+    root.bind("<Control-z>", undo_last_transaction)
     root.mainloop()
