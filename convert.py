@@ -976,7 +976,7 @@ elif args["search"]:
             exit(1)
         target_location = target_location[0]
 
-    REG_CARD_NAME = re.compile(r"(?P<amount>\d+)x (?P<name>[^(]+)\((?P<set>\S+)\) (?P<id>\d+) \[(?P<group>.+)\]")
+    REG_CARD_NAME = re.compile(r"(?P<amount>\d+)x?(?P<name>[^(]+)( \((?P<set>\S+)\) (?P<id>\d+))?( \[(?P<group>.+)\])?")
 
     cards = []
     for card in args["<CARDS>"]:
@@ -1034,12 +1034,25 @@ elif args["search"]:
     ):
         ids.append(id)
         sets.append(m)
-    universe = reduce(set.union, sets)
+    universe = reduce(set.union, sets) if len(sets) else set()
     # assert len(universe) == len(cards)
     not_owned = set(cards) - set(map(cards.__getitem__, universe))
     print("The following cards are not inside your collection:")
+    scryfall_urls = []
     for c in sorted(not_owned):
+        if len(scryfall_urls) == 0 or len(scryfall_urls[-1]) > 900:
+            if len(scryfall_urls):
+                scryfall_urls[-1] += "&order=color&unique=card"
+            scryfall_urls.append(f'https://scryfall.com/search?q=!"{c.replace(" ", "+")}"')
+        else:
+            scryfall_urls[-1] += f'+or+!"{c.replace(" ", "+")}"'
         print("\t", c)
+    if len(scryfall_urls):
+        scryfall_urls[-1] += "&order=color&unique=card"
+    print("\n".join(scryfall_urls))
+    if not len(universe):
+        print("No missing card is still in your collection.")
+        exit(0)
     c = [1] * len(sets)
     a_ub = []
     b_ub = []
