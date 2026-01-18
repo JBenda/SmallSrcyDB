@@ -11,10 +11,13 @@ Usage:
     convert.py fetch-images <DB>
     convert.py fetch-front-side <JSON> <DB>
     convert.py fetch-sets <JSON> <DB>
+    convert.py value <JSON> <DB> [--top <n> --bulk_threshold <eur>]
 
 Options:
-    -c --console  Disable GUI and only produce console output.
+    -c --console            Disable GUI and only produce console output.
     -t --target <location>  Location where to move the cards.
+    --top <n>               print only the top n elements [default:  10].
+    --bulk_threshold <eur>  value under which cards are treated as bulk in eur [default:  5.].
 """
 
 from docopt import docopt
@@ -34,6 +37,8 @@ from tkinter.messagebox import Message
 from PIL import ImageTk, Image
 import io
 from functools import partial, reduce
+
+USD_TO_EUR = 0.86
 
 CARD_TABLE = """
 create table cards(
@@ -279,6 +284,20 @@ def undo_move(windows, transactions, cur, con):
             print(f"moved cards {transactions.pop()[1:]}")
 
 
+def parse_price(j_obj):
+    """Selects or appoximate eur price."""
+
+    if j_obj["eur"] is not None:
+        return float(j_obj["eur"])
+    if j_obj["eur_foil"] is not None:
+        return float(j_obj["eur_foil"])
+    if j_obj["usd"] is not None:
+        return float(j_obj["usd"]) * USD_TO_EUR
+    if j_obj["usd_foil"] is not None:
+        return float(j_obj["usd_foil"]) * USD_TO_EUR
+    return None
+
+
 args = docopt(__doc__, version="convert.py 1.0")
 if args["new"]:
     if path.isfile(args["<DB>"]):
@@ -411,6 +430,44 @@ elif args["update"]:
                 data = []
                 image_data = []
 
+elif args["value"]:
+    con = sqlite3.connect(args["<DB>"])
+    cur = con.cursor()
+    with open(args["<JSON>"], "r", encoding="utf-8") as file:
+        parser = ijson.items(file, "item")
+        lut = {}
+        for item in parser:
+            lut[item["id"]] = parse_price(item["prices"])
+    not_priced_cards = []
+    value_cards = []
+    bulk_cnt = 0
+    total_cnt = cur.execute("SELECT COUNT(*) FROM collection").fetchone()[0]
+    bulk_threshold = float(args["--bulk_threshold"])
+    with tqdm(total=total_cnt) as pbar:
+        for id, cnt in cur.execute("SELECT card_id, COUNT(id) FROM collection GROUP BY card_id"):
+            value = lut[id]
+            if value is None:
+                not_priced_cards.append((id, cnt))
+            elif value > bulk_threshold:
+                value_cards.append((id, cnt, value))
+            else:
+                bulk_cnt += cnt
+            pbar.update(cnt)
+    not_priced_card_cnt = reduce(lambda a, b: a + b[1], not_priced_cards, 0)
+    total_value = reduce(lambda a, b: a + b[1] * b[2], value_cards, 0)
+    print(f"Total value: {round(total_value, 2)}€")
+    print(f"in {total_cnt - bulk_cnt - not_priced_card_cnt} cards")
+    print(f"you have {bulk_cnt} bulk cads and for {not_priced_card_cnt} I was unable to determine a price.")
+    print("Your most valuable cards are:")
+    most_valued = sorted(value_cards, key=lambda x: x[1] * x[2], reverse=True)[:int(args["--top"])]
+    for (name, cid, set_name), (_, cnt, value) in zip(
+        cur.execute(
+            "SELECT name, collector_number, set_name FROM (SELECT value AS id FROM json_each(?)) AS selection LEFT JOIN cards ON selection.id = cards.id",
+            (json.dumps(list(map(lambda x: x[0], most_valued))),),
+        ),
+        most_valued,
+    ):
+        print(f"\t{cnt}x {round(value, 2):>6.2f}€\t{set_name:<4} {cid:>8}:\t{name}")
 elif args["fetch-sets"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
