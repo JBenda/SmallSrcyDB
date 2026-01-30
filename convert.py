@@ -5,7 +5,7 @@ Important: the db should not exists yet!
 
 Usage:
     convert.py collection <DB>
-    convert.py search [-c] [-t <location>] <DB> <CARDS>...
+    convert.py search [-c] [-t <location>] [-e] <DB> <CARDS>...
     convert.py new <JSON> <DB>
     convert.py update <JSON> <DB>
     convert.py fetch-images <DB>
@@ -16,6 +16,7 @@ Usage:
 Options:
     -c --console            Disable GUI and only produce console output.
     -t --target <location>  Location where to move the cards.
+    -e --exploite           Allowes search to use cards from other decks
     --top <n>               print only the top n elements [default:  10].
     --bulk_threshold <eur>  value under which cards are treated as bulk in eur [default:  5.].
 """
@@ -1084,8 +1085,8 @@ elif args["search"]:
             "    SELECT cards.id, cards.name FROM json_each(?) json JOIN cards ON json.value = cards.name)) "
             "card JOIN collection coll on card.id = coll.card_id "
             "JOIN locations on coll.location = locations.id "
-            "WHERE type != 'commander'"
-            "GROUP BY coll.location",
+            + ("" if args["--exploite"] else "WHERE type != 'commander' ")
+            + "GROUP BY coll.location",
             (json.dumps(cards),),
         ),
     ):
