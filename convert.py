@@ -12,6 +12,7 @@ Usage:
     convert.py fetch-front-side <JSON> <DB>
     convert.py fetch-sets <JSON> <DB>
     convert.py value <JSON> <DB> [--top <n> --bulk_threshold <eur>]
+    convert.py export <DB> <location>
 
 Options:
     -c --console            Disable GUI and only produce console output.
@@ -306,6 +307,7 @@ if args["new"]:
         exit(1)
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
     cur.execute(REG_IGNORE.sub("", CARD_TABLE))
     cur.execute(REG_IGNORE.sub("", IMAGE_TABLE))
 
@@ -434,6 +436,7 @@ elif args["update"]:
 elif args["value"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
     with open(args["<JSON>"], "r", encoding="utf-8") as file:
         parser = ijson.items(file, "item")
         lut = {}
@@ -460,7 +463,7 @@ elif args["value"]:
     print(f"in {total_cnt - bulk_cnt - not_priced_card_cnt} cards")
     print(f"you have {bulk_cnt} bulk cads and for {not_priced_card_cnt} I was unable to determine a price.")
     print("Your most valuable cards are:")
-    most_valued = sorted(value_cards, key=lambda x: x[1] * x[2], reverse=True)[:int(args["--top"])]
+    most_valued = sorted(value_cards, key=lambda x: x[1] * x[2], reverse=True)[: int(args["--top"])]
     for (name, cid, set_name), (_, cnt, value) in zip(
         cur.execute(
             "SELECT name, collector_number, set_name FROM (SELECT value AS id FROM json_each(?)) AS selection LEFT JOIN cards ON selection.id = cards.id",
@@ -472,6 +475,7 @@ elif args["value"]:
 elif args["fetch-sets"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
     sets = {}
     check_table(SET_TABLE, "sets")
     with open(args["<JSON>"], "r", encoding="utf-8") as file:
@@ -486,6 +490,7 @@ elif args["fetch-sets"]:
 elif args["fetch-images"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
     insert = con.cursor()
     (cnt,) = next(cur.execute("SELECT COUNT(*) FROM images WHERE image IS NULL and uri IS NOT NULL"))
     with tqdm(total=cnt) as pbar:
@@ -501,6 +506,7 @@ elif args["fetch-images"]:
 elif args["fetch-front-side"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
     with open(args["<JSON>"], "r", encoding="utf-8") as file:
         parser = ijson.items(file, "item")
         with tqdm(
@@ -1015,6 +1021,26 @@ elif args["collection"]:
 
     root.bind("<Escape>", key_press)
     root.mainloop()
+elif args["export"]:
+    con = sqlite3.connect(args["<DB>"])
+    cur = con.cursor()
+    cur.execute("PRAGMA foreign_keys = ON")
+    if (location := REG_LOCATION.match(args["<location>"])) is None:
+        print(f"unable to parse location '{args['<location>']}'")
+        exit(1)
+    if (
+        location := cur.execute(
+            "SELECT id FROM locations WHERE type = ? AND reference = ?", tuple(location.groupdict().values())
+        ).fetchone()
+    ) is None:
+        print(f"loctaion '{args['<location>']}' does not exists")
+        exit(1)
+    print(f"?{location}")
+    for name, set_name, cid, cnt in cur.execute(
+        "SELECT name,set_name,collector_number,COUNT(*) FROM collection LEFT JOIN cards ON cards.id = collection.card_id AND collection.location = ? GROUP BY set_name,collector_number",
+        location,
+    ):
+        print(f"{cnt}x {name} ({set_name}) {cid}")
 elif args["search"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
@@ -1022,7 +1048,7 @@ elif args["search"]:
 
     if (target_location := args["--target"]) is not None:
         if (target_location := REG_LOCATION.match(target_location)) is None:
-            print(f"unable to parse location '{target_location}'")
+            print(f"unable to parse location '{args['--target']}'")
             exit(1)
         if (
             target_location := cur.execute(
