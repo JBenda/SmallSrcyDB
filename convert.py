@@ -12,7 +12,7 @@ Usage:
     convert.py fetch-front-side <JSON> <DB>
     convert.py fetch-sets <JSON> <DB>
     convert.py value <JSON> <DB> [--top <n> --bulk_threshold <eur>]
-    convert.py export <DB> <location>
+    convert.py export <DB> <location> [--format <format>]
 
 Options:
     -c --console            Disable GUI and only produce console output.
@@ -20,6 +20,10 @@ Options:
     -e --exploite           Allowes search to use cards from other decks
     --top <n>               print only the top n elements [default:  10].
     --bulk_threshold <eur>  value under which cards are treated as bulk in eur [default:  5.].
+    -f --format <format>    format in which an import/export is formatted [default:  archidect].
+                            supported formats are:
+                            + archidect
+                            + qid : csv quantity,scryfall_id
 """
 
 from docopt import docopt
@@ -39,6 +43,7 @@ from tkinter.messagebox import Message
 from PIL import ImageTk, Image
 import io
 from functools import partial, reduce
+from enum import Enum
 
 USD_TO_EUR = 0.86
 
@@ -1025,22 +1030,42 @@ elif args["export"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
     cur.execute("PRAGMA foreign_keys = ON")
-    if (location := REG_LOCATION.match(args["<location>"])) is None:
-        print(f"unable to parse location '{args['<location>']}'")
-        exit(1)
-    if (
-        location := cur.execute(
-            "SELECT id FROM locations WHERE type = ? AND reference = ?", tuple(location.groupdict().values())
-        ).fetchone()
-    ) is None:
-        print(f"loctaion '{args['<location>']}' does not exists")
-        exit(1)
-    print(f"?{location}")
-    for name, set_name, cid, cnt in cur.execute(
-        "SELECT name,set_name,collector_number,COUNT(*) FROM collection LEFT JOIN cards ON cards.id = collection.card_id AND collection.location = ? GROUP BY set_name,collector_number",
-        location,
-    ):
-        print(f"{cnt}x {name} ({set_name}) {cid}")
+    if args["<location>"].upper() == "ALL":
+        location = None
+    else:
+        if (location := REG_LOCATION.match(args["<location>"])) is None:
+            print(f"unable to parse location '{args['<location>']}'")
+            exit(1)
+        if (
+            location := cur.execute(
+                "SELECT id FROM locations WHERE type = ? AND reference = ?", tuple(location.groupdict().values())
+            ).fetchone()
+        ) is None:
+            print(f"loctaion '{args['<location>']}' does not exists")
+            exit(1)
+    if location is not None:
+        query = cur.execute(
+            "SELECT name,set_name,collector_number,cards.id,language,COUNT(*) FROM collection LEFT JOIN cards ON cards.id = collection.card_id AND collection.location = ? GROUP BY cards.id",
+            location,
+        )
+    else:
+        query = cur.execute(
+            "SELECT name,set_name,collector_number,cards.id,language,COUNT(*) FROM collection LEFT JOIN cards ON cards.id = collection.card_id GROUP BY cards.id"
+        )
+
+    class Format(Enum):
+        QUANTITY_UUID = "qid"
+        ARCHIDECT = "archidect"
+
+    format = Format(args["--format"])
+    if format == Format.QUANTITY_UUID:
+        print("quantity,uuid,language")
+    for name, set_name, cid, uuid, language, cnt in query:
+        match format:
+            case Format.ARCHIDECT:
+                print(f"{cnt}x {name} ({set_name}) {cid}")
+            case Format.QUANTITY_UUID:
+                print(f"{cnt},{uuid},{language.upper()}")
 elif args["search"]:
     con = sqlite3.connect(args["<DB>"])
     cur = con.cursor()
